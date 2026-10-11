@@ -2,6 +2,7 @@ package dynamodb_storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/smithy-go"
 	go_iterator "github.com/golang-infrastructure/go-iterator"
 	"github.com/storage-lock/go-storage"
 	storage_lock "github.com/storage-lock/go-storage-lock"
@@ -23,6 +25,22 @@ type DynamoDBStorage struct {
 }
 
 var _ storage.Storage = &DynamoDBStorage{}
+
+// 对象操作默认走真实客户端。Client 方法是值接收者且需要 AWS 配置，测试通过替换这些函数覆盖分支。
+var (
+	dynamoPutItem = func(client *dynamodb.Client, ctx context.Context, input *dynamodb.PutItemInput) (*dynamodb.PutItemOutput, error) {
+		return client.PutItem(ctx, input)
+	}
+	dynamoDeleteItem = func(client *dynamodb.Client, ctx context.Context, input *dynamodb.DeleteItemInput) (*dynamodb.DeleteItemOutput, error) {
+		return client.DeleteItem(ctx, input)
+	}
+	dynamoGetItem = func(client *dynamodb.Client, ctx context.Context, input *dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error) {
+		return client.GetItem(ctx, input)
+	}
+	dynamoScan = func(client *dynamodb.Client, ctx context.Context, input *dynamodb.ScanInput) (*dynamodb.ScanOutput, error) {
+		return client.Scan(ctx, input)
+	}
+)
 
 func NewDynamoDBStorage(ctx context.Context, options *DynamoDBStorageOptions) (*DynamoDBStorage, error) {
 	if err := options.Check(); err != nil {
@@ -46,6 +64,7 @@ func (x *DynamoDBStorage) Capabilities() []storage.StorageCapability {
 		storage.CapabilityCAS,
 		storage.CapabilityReliableTime,
 		storage.CapabilityAtomicDelete,
+		storage.CapabilityWatch,
 	}
 }
 
@@ -73,7 +92,7 @@ func (p *LocalTimeProvider) GetTime(ctx context.Context) (time.Time, error) {
 // CreateWithVersion 原子创建锁记录
 // 使用 ConditionExpression 确保 lockId 不存在
 func (x *DynamoDBStorage) CreateWithVersion(ctx context.Context, lockId string, version storage.Version, lockInformation *storage.LockInformation) error {
-	_, err := x.client.PutItem(ctx, &dynamodb.PutItemInput{
+	_, err := dynamoPutItem(x.client, ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(x.options.TableName),
 		Item: map[string]types.AttributeValue{
 			"LockId":  &types.AttributeValueMemberS{Value: lockId},
@@ -93,7 +112,7 @@ func (x *DynamoDBStorage) CreateWithVersion(ctx context.Context, lockId string, 
 
 // UpdateWithVersion 原子更新锁记录
 func (x *DynamoDBStorage) UpdateWithVersion(ctx context.Context, lockId string, expectedVersion, newVersion storage.Version, lockInformation *storage.LockInformation) error {
-	_, err := x.client.PutItem(ctx, &dynamodb.PutItemInput{
+	_, err := dynamoPutItem(x.client, ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(x.options.TableName),
 		Item: map[string]types.AttributeValue{
 			"LockId":  &types.AttributeValueMemberS{Value: lockId},
@@ -116,7 +135,7 @@ func (x *DynamoDBStorage) UpdateWithVersion(ctx context.Context, lockId string, 
 
 // DeleteWithVersion 原子删除锁记录
 func (x *DynamoDBStorage) DeleteWithVersion(ctx context.Context, lockId string, expectedVersion storage.Version, lockInformation *storage.LockInformation) error {
-	_, err := x.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+	_, err := dynamoDeleteItem(x.client, ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(x.options.TableName),
 		Key: map[string]types.AttributeValue{
 			"LockId": &types.AttributeValueMemberS{Value: lockId},
@@ -136,7 +155,7 @@ func (x *DynamoDBStorage) DeleteWithVersion(ctx context.Context, lockId string, 
 }
 
 func (x *DynamoDBStorage) Get(ctx context.Context, lockId string) (string, error) {
-	result, err := x.client.GetItem(ctx, &dynamodb.GetItemInput{
+	result, err := dynamoGetItem(x.client, ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(x.options.TableName),
 		Key: map[string]types.AttributeValue{
 			"LockId": &types.AttributeValueMemberS{Value: lockId},
@@ -171,7 +190,7 @@ func (x *DynamoDBStorage) Close(ctx context.Context) error {
 func (x *DynamoDBStorage) List(ctx context.Context) (go_iterator.Iterator[*storage.LockInformation], error) {
 	slice := make([]*storage.LockInformation, 0)
 
-	result, err := x.client.Scan(ctx, &dynamodb.ScanInput{
+	result, err := dynamoScan(x.client, ctx, &dynamodb.ScanInput{
 		TableName: aws.String(x.options.TableName),
 	})
 	if err != nil {
@@ -197,10 +216,24 @@ func (x *DynamoDBStorage) List(ctx context.Context) (go_iterator.Iterator[*stora
 	return go_iterator.FromSlice(slice), nil
 }
 
+func (x *DynamoDBStorage) Watch(ctx context.Context, lockId string) (<-chan *storage.LockInformation, error) {
+	return storage.NewPollingLockWatcher(x, 500*time.Millisecond).Watch(ctx, lockId)
+}
+
 func isConditionalCheckFailed(err error) bool {
 	if err == nil {
 		return false
 	}
-	_, ok := err.(*types.ConditionalCheckFailedException)
-	return ok
+	// v2 SDK 的错误经常被 smithy.OperationError 等包装，裸指针类型断言会失效。
+	// 先 errors.As 解包具体类型，再兜底按 ErrorCode 字符串判定（对齐 mongo 仓
+	// 用 mongo.IsDuplicateKeyError 而不用字符串匹配的思路）。
+	var condErr *types.ConditionalCheckFailedException
+	if errors.As(err, &condErr) {
+		return true
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode() == "ConditionalCheckFailedException"
+	}
+	return false
 }

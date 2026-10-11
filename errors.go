@@ -4,5 +4,5 @@ import "fmt"
 
 var (
 	ErrTableNameEmpty       = fmt.Errorf("TableName can not empty")
-	ErrConnectionManagerNil  = fmt.Errorf("ConnectionManager can not nil")
+	ErrConnectionManagerNil = fmt.Errorf("ConnectionManager can not nil")
 )
