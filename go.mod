@@ -4,11 +4,13 @@ go 1.23
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.36.3
+	github.com/aws/aws-sdk-go-v2/credentials v1.17.8
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.42.0
 	github.com/aws/smithy-go v1.22.2
 	github.com/golang-infrastructure/go-iterator v0.0.0-20230524171120-56988a9b127c
 	github.com/storage-lock/go-storage v0.0.3
 	github.com/storage-lock/go-storage-lock v0.0.6
+	github.com/storage-lock/go-storage-test-helper v0.0.5
 	github.com/stretchr/testify v1.11.1
 )
 
